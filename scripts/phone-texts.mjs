@@ -8,27 +8,50 @@
 import { copyFileSync, existsSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const HELP = `phone-link-texts: read the paired phone's texts from Phone Link's local database, read-only.
 
 Commands:
-  contacts NAME [NAME ...]         Contacts whose name or nickname contains each NAME.
-  threads [--with NAME ...]        Conversations newest first, with participants.
-                                   --with keeps threads that include every NAME. A NAME
-                                   with digits also matches the end of a phone number.
-  read THREAD_ID [--grep REGEX]    Messages in one conversation, oldest first.
-  span                             Dates of the oldest and newest message held.
-  query SQL                        Run one SELECT, WITH, or VALUES statement against
-                                   the copy. The contacts database is attached as
-                                   "contacts". Anything that writes is refused.
+  contacts NAME [NAME ...]   Contacts whose name or nickname contains each NAME.
+  threads                    Conversations newest first, with participants.
+  read THREAD_ID             Messages in one conversation, oldest first.
+  span                       Dates of the oldest and newest message held.
+  query SQL                  Run one SELECT, WITH, or VALUES statement against the
+                             copy. The contacts database is attached as "contacts".
+                             Anything that writes is refused.
+  path                       This script's own file path, for running it with node
+                             directly. Reads no database.
 
 Options:
-  --since DATE      threads, read: on or after this local date (YYYY-MM-DD).
-  --until DATE      threads, read: on or before this local date.
-  --grep REGEX      read: only messages matching this case-insensitive pattern.
+  --with NAME [NAME ...]
+                    threads: only conversations that include every NAME. A NAME
+                    with digits also matches the end of a phone number.
+  --since WHEN      read: messages at or after WHEN.
+                    threads: conversations whose newest message is at or after WHEN.
+  --until WHEN      read: messages up to and including WHEN.
+                    threads: conversations whose newest message is no later than WHEN.
+  --from NAME       read: only messages whose sender contains NAME, or whose number
+                    ends with its digits. "me" is the phone's owner, messages not
+                    yet sent included, and "me (not sent)" is those alone. Repeat
+                    the flag to accept several senders.
+  --grep REGEX      read: only messages matching this case-insensitive JavaScript
+                    regular expression.
+  --last N          read: only the newest N of the messages that pass the other
+                    filters, still oldest first.
   --json            contacts, threads, read, span: one JSON object per line.
                     query always prints JSON.
+
+WHEN is one of:
+  2025-01-31                  A local day.
+  Fri 2025-01-31 02:05PM      A local time as the text output prints it. The weekday
+                              is optional, and 14:05 or 14:05:30 also work.
+  2025-01-31T19:05:00.000Z    A time with a zone, as --json prints it.
+A bound covers the whole day, minute, second, or millisecond written, so a time
+copied from a message includes that message. When clocks fall back and a local
+time happens twice, a bound starts at its first occurrence and ends after its
+second, so results in that hour can include times that look out of range.
 
 Each run reads a private copy of the database and deletes it before exiting.
 Nothing is ever written or sent. The schema for query is in the skill's
@@ -47,9 +70,10 @@ const UNSENT = new Set([3n, 4n, 5n, 6n]); // Android: 3 draft, 4 outbox, 5 faile
 const COMMAND_SHAPE = {
   contacts: { options: ["json"], positionals: "some" },
   threads: { options: ["since", "until", "with", "json"], positionals: "none" },
-  read: { options: ["since", "until", "grep", "json"], positionals: "one" },
+  read: { options: ["since", "until", "from", "grep", "last", "json"], positionals: "one" },
   span: { options: ["json"], positionals: "none" },
   query: { options: [], positionals: "one" },
+  path: { options: [], positionals: "none" },
 };
 
 class Failure extends Error {}
@@ -149,25 +173,70 @@ function toDate(fileTime) {
   return new Date(Number(BigInt(fileTime) / 10000n - EPOCH_OFFSET_MS));
 }
 
-// Local midnight at the start of the named day, plus dayOffset days, as a file time.
-// Stepping by calendar day rather than by 24 hours keeps daylight-saving days whole.
-function toFileTime(flag, day, dayOffset = 0) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day ?? "");
-  const [year, month, date] = match ? match.slice(1).map(Number) : [];
-  const local = match && year >= 1900 ? new Date(year, month - 1, date) : null;
-  if (!local || local.getMonth() !== month - 1 || local.getDate() !== date) {
-    throw new Failure(`--${flag} must be a date like 2025-01-31, not "${day}"`);
+const toFileTime = (ms) => (BigInt(ms) + EPOCH_OFFSET_MS) * 10000n;
+
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+// A bound names a span of time: a local day, a local minute or second on a day in the
+// form the text output prints, or a time with a zone in the form --json prints, to the
+// second or the millisecond. Returns the file times where that span starts and where it
+// ends, the end exclusive, and where its first occurrence ends when the span happens twice.
+function whenSpan(flag, text) {
+  const fail = () =>
+    new Failure(`--${flag} must be a day like 2025-01-31, a local time like "2025-01-31 02:05PM" or "2025-01-31 14:05", or a time with a zone like 2025-01-31T19:05:00Z, not "${text}"`);
+  const trimmed = String(text ?? "").trim();
+  // The text output leads each time with a weekday.
+  const weekday = /^(sun|mon|tue|wed|thu|fri|sat)\s+/i.exec(trimmed);
+  const input = weekday ? trimmed.slice(weekday[0].length) : trimmed;
+  const day = /^(\d{4})-(\d{2})-(\d{2})/.exec(input);
+  const [year, month, date] = day ? day.slice(1).map(Number) : [];
+  const calendar = day ? new Date(Date.UTC(year, month - 1, date)) : null;
+  if (!day || year < 1900 || calendar.getUTCMonth() !== month - 1 || calendar.getUTCDate() !== date) throw fail();
+  const rest = input.slice(day[0].length);
+  const zoned = /^T\d{2}:\d{2}(:\d{2}(\.\d{3})?)?(Z|[+-]\d{2}:\d{2})$/i.exec(rest);
+  if (zoned) {
+    const start = weekday ? NaN : Date.parse(input.toUpperCase());
+    if (Number.isNaN(start)) throw fail();
+    const end = toFileTime(start + (zoned[2] ? 1 : zoned[1] ? 1000 : 60000));
+    return { start: toFileTime(start), end, firstEnd: end };
   }
-  const start = new Date(year, month - 1, date + dayOffset);
-  return (BigInt(start.getTime()) + EPOCH_OFFSET_MS) * 10000n;
+  const actual = WEEKDAYS[calendar.getUTCDay()];
+  if (weekday && actual.toLowerCase() !== weekday[1].toLowerCase()) {
+    throw new Failure(`--${flag}: ${day[0]} is a ${actual}, not a ${weekday[1]}. Correct "${text}" or leave the weekday out.`);
+  }
+  if (!rest) {
+    // Stepping by calendar day rather than by 24 hours keeps daylight-saving days whole.
+    const end = toFileTime(new Date(year, month - 1, date + 1).getTime());
+    return { start: toFileTime(new Date(year, month - 1, date).getTime()), end, firstEnd: end };
+  }
+  const clock = /^ (\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AP]M)?$/i.exec(rest);
+  if (!clock) throw fail();
+  const minute = Number(clock[2]);
+  const second = clock[3] === undefined ? null : Number(clock[3]);
+  const half = clock[4]?.toUpperCase();
+  let hour = Number(clock[1]);
+  if (half ? hour < 1 || hour > 12 : hour > 23) throw fail();
+  if (half) hour = (hour % 12) + (half === "PM" ? 12 : 0);
+  if (minute > 59 || second > 59) throw fail();
+  const start = new Date(year, month - 1, date, hour, minute, second ?? 0);
+  const sameClock = (other) => other.getDate() === date && other.getHours() === hour && other.getMinutes() === minute;
+  if (!sameClock(start)) throw new Failure(`--${flag}: "${text}" is a time the local clock skipped that day.`);
+  // When clocks fall back, a local time happens twice and both print alike. The bound runs from
+  // the first occurrence through the second, so it includes whichever message it was copied from.
+  const fallBack = new Date(start.getTime() + 3 * 3600000).getTimezoneOffset() - start.getTimezoneOffset();
+  const again = fallBack > 0 ? new Date(start.getTime() + fallBack * 60000) : null;
+  const lastStart = again && sameClock(again) ? again : start;
+  const unit = second === null ? 60000 : 1000;
+  return { start: toFileTime(start.getTime()), end: toFileTime(lastStart.getTime() + unit), firstEnd: toFileTime(start.getTime() + unit) };
 }
 
 function dateRange(values) {
-  const since = values.since ? toFileTime("since", values.since) : 0n;
-  // --until includes the whole named day: it ends at the next day's local midnight.
-  const until = values.until ? toFileTime("until", values.until, 1) : 2n ** 62n;
-  if (since >= until) throw new Failure("--since must be on or before --until.");
-  return { since, until };
+  const since = values.since === undefined ? 0n : whenSpan("since", values.since).start;
+  // --until includes the whole span it names.
+  const last = values.until === undefined ? null : whenSpan("until", values.until);
+  // The order is judged on first occurrences, so a repeated hour cannot make a reversed pair look valid.
+  if (last && since >= last.firstEnd) throw new Failure("--since must not be later than --until.");
+  return { since, until: last ? last.end : 2n ** 62n };
 }
 
 function fmt(date) {
@@ -203,11 +272,21 @@ function sender(type, from, book) {
   return book.get(digits(from)) ?? (from || "unknown");
 }
 
+// A name to match people by: its lowercase text, and its digits for matching the end of a phone number.
+// An empty name would match everyone, which makes an unfiltered result look filtered.
+function nameFilter(flag, name, kind = "a name or a number") {
+  const text = name.trim().toLowerCase();
+  if (!text) throw new Failure(`${flag} needs ${kind}, not an empty value.`);
+  return { text, digits: name.replace(/\D/g, "") };
+}
+
+const namesPerson = (w, name, personDigits) => String(name).toLowerCase().includes(w.text) || (w.digits.length >= 4 && personDigits.endsWith(w.digits.slice(-10)));
+
 function cmdContacts({ contacts }, { values, positionals }) {
   if (!contacts) throw new Failure("contacts.db is missing, so names cannot be resolved.");
   const all = rows(contacts, "select display_name, nickname from contact");
   for (const query of positionals) {
-    const q = query.toLowerCase();
+    const q = nameFilter("contacts", query, "a name").text;
     const hits = all
       .filter(({ display_name: dn, nickname: nn }) => (dn ?? "").toLowerCase().includes(q) || (nn ?? "").toLowerCase().includes(q))
       .map(({ display_name: dn, nickname: nn }) => (dn && nn ? `${dn} (${nn})` : dn || nn));
@@ -220,8 +299,8 @@ function cmdThreads({ phone, contacts }, { values }) {
   const book = nameBook(contacts);
   const people = participants(phone, book);
   const { since, until } = dateRange(values);
-  const wanted = (values.with ?? []).map((w) => ({ text: w.toLowerCase(), digits: w.replace(/\D/g, "") }));
-  const matches = (w, names) => names.some((n) => String(n.name).toLowerCase().includes(w.text) || (w.digits.length >= 4 && n.digits.endsWith(w.digits.slice(-10))));
+  const wanted = (values.with ?? []).map((w) => nameFilter("--with", w));
+  const matches = (w, names) => names.some((n) => namesPerson(w, n.name, n.digits));
   const list = rows(phone, "select thread_id, timestamp, msg_count from conversation where timestamp >= ? and timestamp < ? and msg_count > 0 order by timestamp desc", since, until);
   for (const { thread_id, timestamp, msg_count } of list) {
     const names = people.get(thread_id) ?? [];
@@ -242,34 +321,51 @@ function cmdRead({ phone, contacts }, { values, positionals }) {
     try {
       pattern = new RegExp(values.grep, "i");
     } catch (err) {
-      throw new Failure(`--grep is not a valid regular expression: ${err.message}`);
+      throw new Failure(`--grep is not a valid regular expression: ${err.message}. Patterns use JavaScript syntax and are case-insensitive.`);
     }
   }
+  if (values.last !== undefined && !/^[1-9]\d*$/.test(values.last)) throw new Failure(`--last must be a whole number of messages, 1 or more, not "${values.last}"`);
+  const last = values.last === undefined ? null : Number(values.last);
+  // The phone's owner has no name to match, so the two labels printed for the owner select by message type.
+  const OWNER = new Map([["me", "any"], ["me (not sent)", "unsent"]]);
+  const senders = (values.from ?? []).map((w) => ({ ...nameFilter("--from", w), raw: w, owner: OWNER.get(w.trim().toLowerCase()) }));
   if (!rows(phone, "select 1 from conversation where thread_id = ?", thread).length) {
     throw new Failure(`no conversation has id ${thread}. Ids are local to this computer: find it again with threads --with.`);
   }
   const book = nameBook(contacts);
   const messages = [];
   for (const m of rows(phone, "select timestamp, from_address, type, body from message where thread_id = ? and timestamp >= ? and timestamp < ?", thread, since, until)) {
-    messages.push({ ts: m.timestamp, from: sender(m.type, m.from_address, book), text: m.body ?? "", attachments: [] });
+    messages.push({ ts: m.timestamp, sent: m.type === SENT, unsent: UNSENT.has(m.type), digits: digits(m.from_address), from: sender(m.type, m.from_address, book), text: m.body ?? "", attachments: [] });
   }
   for (const m of rows(phone, "select message_id, timestamp, from_address, type from mms where thread_id = ? and timestamp >= ? and timestamp < ?", thread, since, until)) {
     const parts = rows(phone, "select content_type, text from mms_part where message_id = ?", m.message_id);
     const text = parts.filter((p) => p.content_type === "text/plain" && p.text).map((p) => p.text).join(" ").trim();
     const attachments = parts.map((p) => p.content_type).filter((ct) => ct !== "text/plain" && ct !== "application/smil");
-    messages.push({ ts: m.timestamp, from: sender(m.type, m.from_address, book), text, attachments });
+    messages.push({ ts: m.timestamp, sent: m.type === SENT, unsent: UNSENT.has(m.type), digits: digits(m.from_address), from: sender(m.type, m.from_address, book), text, attachments });
   }
   messages.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
-  let shown = 0;
-  for (const m of messages) {
-    const label = [m.text, m.attachments.length ? `[${m.attachments.join(", ")}]` : ""].filter(Boolean).join(" ") || "[no text]";
-    if (pattern && !pattern.test(label)) continue;
-    shown += 1;
+  const label = (m) => [m.text, m.attachments.length ? `[${m.attachments.join(", ")}]` : ""].filter(Boolean).join(" ") || "[no text]";
+  const own = (m) => m.sent || m.unsent;
+  const fromWanted = (m) => senders.some((w) => (w.owner ? (w.owner === "any" ? own(m) : m.unsent) : !own(m) && namesPerson(w, m.from, m.digits)));
+  // A name that fits nobody here would otherwise read as that person having said nothing.
+  // Everyone who ever wrote in the conversation counts, whatever the time bounds, since a sender can be missing from the participant list.
+  const everWrote = rows(phone, "select from_address, type from message where thread_id = ? union select from_address, type from mms where thread_id = ?", thread, thread)
+    .filter((m) => m.type !== SENT && !UNSENT.has(m.type))
+    .map((m) => ({ name: sender(m.type, m.from_address, book), digits: digits(m.from_address) }));
+  const others = [...(participants(phone, book).get(thread) ?? []), ...everWrote];
+  for (const w of senders) {
+    if (!w.owner && !others.some((p) => namesPerson(w, p.name, p.digits))) console.error(`note: no one in this conversation matches "${w.raw}".`);
+  }
+  const passing = messages.filter((m) => (!senders.length || fromWanted(m)) && (!pattern || pattern.test(label(m))));
+  const shown = last === null ? passing : passing.slice(-last);
+  for (const m of shown) {
     if (values.json) console.log(jsonSafe({ time: toDate(m.ts)?.toISOString(), from: m.from, text: m.text, attachments: m.attachments }));
     // A line break inside a message becomes an indented continuation, so every message still starts on its own prefixed line.
-    else console.log(`${fmt(toDate(m.ts))} | ${m.from}: ${label.replace(/\r?\n/g, "\n    ")}`);
+    else console.log(`${fmt(toDate(m.ts))} | ${m.from}: ${label(m).replace(/\r?\n/g, "\n    ")}`);
   }
-  if (!values.json) console.log(`${shown} of ${messages.length} messages shown`);
+  // When --last trims a filtered result, the count of what matched is the only sign of how much was left out.
+  const trimmed = shown.length < passing.length && passing.length < messages.length ? `, the newest of ${passing.length} that match` : "";
+  if (!values.json) console.log(`${shown.length} of ${messages.length} messages shown${trimmed}`);
   const rcs = rows(phone, "select count(*) as n from rcs_chat")[0].n;
   if (rcs) console.error(`note: the database holds ${rcs} chat-feature (RCS) messages, which this script does not read.`);
 }
@@ -348,13 +444,19 @@ function parse() {
         since: { type: "string" },
         until: { type: "string" },
         with: { type: "string", multiple: true },
+        from: { type: "string", multiple: true },
         grep: { type: "string" },
+        last: { type: "string" },
         json: { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
     });
   } catch (err) {
-    throw new Failure(`${err.message}. Run with --help for the commands.`);
+    // parseArgs spreads some messages over several lines, and follows an unknown option with advice
+    // about positionals that start with a dash, which no command here takes.
+    const flat = String(err.message).replace(/\s+/g, " ").trim();
+    const message = flat.replace(/\. To specify a positional argument starting with .*$/, "").replace(/\.+$/, "");
+    throw new Failure(`${message}. Run with --help for the commands.`);
   }
   const [command, ...positionals] = parsed.positionals;
   const values = { ...parsed.values };
@@ -370,7 +472,10 @@ function parse() {
   if (extra.length) throw new Failure(`${command} does not take ${extra.map((k) => `--${k}`).join(", ")}.`);
   const count = positionals.length;
   if (shape.positionals === "none" && count) throw new Failure(`${command} takes no arguments, but got "${positionals.join(" ")}".${command === "threads" ? " To filter by people, use --with." : ""}`);
-  if (shape.positionals === "one" && count !== 1) throw new Failure(`${command} takes exactly one argument${command === "query" ? ", the SQL statement in quotes" : ""}.`);
+  if (shape.positionals === "one" && count !== 1) {
+    const hint = command === "query" ? ", the SQL statement in quotes" : "";
+    throw new Failure(`${command} takes exactly one argument${hint}.${values.from && count > 1 ? " To accept several senders, repeat --from." : ""}`);
+  }
   if (shape.positionals === "some" && !count) throw new Failure(`${command} needs at least one NAME.`);
   return { command, values, positionals };
 }
@@ -379,6 +484,10 @@ async function main() {
   const args = parse();
   if (args.help) {
     console.log(HELP);
+    return;
+  }
+  if (args.command === "path") {
+    console.log(fileURLToPath(import.meta.url));
     return;
   }
   const DatabaseSync = await loadSqlite();
