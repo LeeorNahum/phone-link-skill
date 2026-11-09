@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
-const HELP = `phone-link-texts: read the paired phone's texts from Phone Link's local database, read-only.
+const HELP = `phone-link: read the paired phone's texts from Phone Link's local database, read-only.
 
 Commands:
   contacts NAME [NAME ...]   Contacts whose name or nickname contains each NAME.
@@ -108,6 +108,11 @@ function sweepStaleCopies() {
   }
 }
 
+// The last time a database or its write-ahead log was written, in milliseconds.
+function lastWrite(path) {
+  return Math.max(...[path, `${path}-wal`].filter(existsSync).map((p) => statSync(p).mtimeMs));
+}
+
 function newestDatabase() {
   const indexed = join(PACKAGE, "LocalCache", "Indexed");
   const dbs = existsSync(indexed)
@@ -118,7 +123,6 @@ function newestDatabase() {
   if (!dbs.length) {
     throw new Failure("no Phone Link message database found. This script works only on the Windows computer where Phone Link is paired with the phone.");
   }
-  const lastWrite = (path) => Math.max(...[path, `${path}-wal`].filter(existsSync).map((p) => statSync(p).mtimeMs));
   dbs.sort((a, b) => lastWrite(b) - lastWrite(a));
   return { src: dbs[0], count: dbs.length };
 }
@@ -141,7 +145,7 @@ function snapshot(DatabaseSync, tmp, opened) {
     contacts = new DatabaseSync(join(tmp, "contacts.db"));
     opened.push(contacts);
   }
-  return { phone, contacts, tmp };
+  return { phone, contacts, tmp, src };
 }
 
 // Timestamps and message types come back as BigInt, because file times exceed JavaScript's safe integer range.
@@ -387,6 +391,35 @@ function cmdSpan({ phone }, { values }) {
   else console.log(`${total} messages held, from ${fmt(toDate(low))} to ${fmt(toDate(high))}`);
 }
 
+const STALE_HOURS = 6;
+const ENCRYPTED_GAP_MS = 10 * 60 * 1000;
+
+// Says how fresh the copy is: when the newest message held was sent or received, and when Phone Link
+// last wrote the database. Newer Phone Link versions keep the live databases encrypted in a
+// .encrypted folder beside the plain ones and stop writing the plain ones, which this script reads.
+function reportFreshness({ phone, src }) {
+  let high = null;
+  for (const table of ["message", "mms"]) {
+    const r = rows(phone, `select max(timestamp) as hi from ${table} where timestamp > 0`)[0];
+    if (r.hi !== null && (high === null || r.hi > high)) high = r.hi;
+  }
+  const newest = toDate(high);
+  const written = new Date(lastWrite(src));
+  console.error(`note: newest message held ${newest ? fmt(newest) : "none"}, database last written ${fmt(written)}.`);
+  const encrypted = join(src, "..", ".encrypted", "phone.db");
+  if (existsSync(encrypted) && lastWrite(encrypted) - written.getTime() > ENCRYPTED_GAP_MS) {
+    console.error(
+      `warning: Phone Link now keeps its live messages in an encrypted database, last written ${fmt(new Date(lastWrite(encrypted)))}. ` +
+        `The plain copy this script reads stopped at ${fmt(written)}, so texts after that are missing here. Read newer texts from the Phone Link window.`,
+    );
+    return;
+  }
+  if (newest && Date.now() - newest.getTime() > STALE_HOURS * 3600 * 1000) {
+    const hours = Math.floor((Date.now() - newest.getTime()) / 3600000);
+    console.error(`warning: the newest message held is ${hours} hours old. If a newer text is expected, open Phone Link, wait for it to sync, and read again.`);
+  }
+}
+
 // The read-only connection refuses ordinary writes, but VACUUM INTO and ATTACH still work on one,
 // and either would put the texts somewhere the cleanup never reaches. So the statement is checked
 // by its text first: exactly one statement, starting with SELECT, WITH, or VALUES, and no keyword
@@ -498,6 +531,7 @@ async function main() {
     tmp = mkdtempSync(join(tmpdir(), TMP_PREFIX));
     const dbs = snapshot(DatabaseSync, tmp, opened);
     COMMANDS[args.command](dbs, args, DatabaseSync, opened);
+    if (["threads", "read", "span"].includes(args.command)) reportFreshness(dbs);
   } catch (err) {
     if (err instanceof Failure) throw err;
     if (err?.code === "ERR_SQLITE_ERROR") {

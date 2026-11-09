@@ -1,21 +1,25 @@
 # AGENTS.md
 
-Rules for editing the **phone-link-texts** skill. User-facing guidance lives in `SKILL.md`. `README.md` is the human skim layer.
+Rules for editing the **phone-link** skill. User-facing guidance lives in `SKILL.md`. `README.md` is the human skim layer.
 
 ## File roles
 
 | File | Role |
 | --- | --- |
 | `SKILL.md` | When the skill applies, both run routes, the command table, privacy rules, and gotchas that change how output is read |
-| `scripts/phone-texts.mjs` | The only executable: copies the database, runs one read command or read-only query, deletes the copy |
+| `scripts/phone-texts.mjs` | Copies the database, runs one read command or read-only query, reports how fresh the copy is, deletes the copy |
+| `scripts/phone-window.ps1` | Reads conversations from the Phone Link window through UI Automation, for texts newer than the copy. Never types, sends, or clicks |
 | `references/schema.md` | Map of the database for the `query` command, and the record of what the script relies on |
 | `package.json` | Exposes the script as a `bin` so `npx github:` runs it without an install |
 | `README.md` | Short human summary |
 
 ## Design notes
 
-- The description keeps a locality boundary: the skill applies only to an agent on the computer that holds Phone Link's files. A description that lets a cloud or remote agent load it wastes that agent's context on a file it cannot reach.
+- The description keeps a locality boundary: the skill applies only to an agent on the computer that holds Phone Link's files and the phone's storage folder. A description that lets a cloud or remote agent load it wastes that agent's context on a file it cannot reach.
 - The script is a shortcut for common reads, never the limit of the skill. `query` keeps every table reachable while the script still owns the copy and its cleanup, so an agent never has to copy the live files by hand.
+- The skill reaches the phone three ways: the script for texts, plain file tools for the storage folder, and desktop control of the Phone Link window for sending. Sending stays out of the script, because Phone Link offers no command or URL that sends, and a send must stay a visible, user-approved action.
+- Deleting, renaming, or overwriting phone files from the computer is blocked by Windows, which also notifies the user. The skill documents that limit and never works around it.
+- Phone Link moved its live databases into an encrypted `.encrypted` folder beside the plain ones, whose header reads `AesGcm1 SQLite3`, and stopped writing the plain ones (first seen 2026-11-08). The per-database keys sit in `LocalCache\PlatformEncryptedKeyStorage.json` as DPAPI blobs, but they are bound to the Phone Link app-container identity, not the plain user: `CryptUnprotectData` as the user fails with "data is invalid" in every scope and with no entropy, so a script running as the user cannot unwrap them. Reading the encrypted database would mean impersonating the app container and reimplementing the AesGcm1 page format, which breaks on each Phone Link update, so the skill does not. The script compares the two folders' last writes and warns when the plain copy has stopped, and the window reader covers the newer texts. If a later Phone Link version stops writing the plain databases altogether, the window reader becomes the main route for recent texts, with the database route kept for the frozen history it still holds.
 - The script stays read-only. It only copies the live files and never opens them as a database or writes them, never gains a way to send, and `query` runs on a read-only connection. It deletes its copy on every exit path it controls, and at startup sweeps copies older than an hour that a killed run left behind. A leaked copy would leave the user's texts in a temporary folder.
 - Each command rejects options and arguments it does not use, and an empty name wherever a name filters. A silently ignored filter makes an unfiltered result look filtered. For the same reason `read` notes on stderr when a `--from` name fits nobody who is in the conversation or ever wrote in it, and its footer says when `--last` trimmed a filtered result.
 - `query` checks the statement's text before running it: exactly one statement, starting with `SELECT`, `WITH`, or `VALUES`, and no writing or attaching keyword outside quotes and comments. A read-only connection alone is not enough, because `VACUUM INTO` and `ATTACH` still work on one and would write the texts to a path the cleanup never reaches. `node:sqlite` has no authorizer hook yet, so this text check is the gate.
@@ -39,6 +43,7 @@ Rules for editing the **phone-link-texts** skill. User-facing guidance lives in 
 
 ## Before finishing
 
+- The window reader's `-List` and `-Read` both run against a live Phone Link window, and it stays ASCII so Windows PowerShell 5.1 reads it correctly.
 - `node --check scripts/phone-texts.mjs` passes, `--help` prints, and each command runs against a real database, in text and in `--json`.
 - A time copied from `read`'s text output and one copied from its `--json` output each work as `--since` and as `--until`, and each includes the message it was copied from, including a message in the repeated hour of a clock change.
 - A writing statement, `VACUUM INTO`, `ATTACH`, and a second statement through `query` are all refused before anything runs, and nothing appears at the target path.
